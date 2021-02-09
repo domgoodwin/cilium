@@ -804,5 +804,56 @@ func IPToPrefix(ip net.IP) *net.IPNet {
 
 // IsIPv4 returns true if the given IP is an IPv4
 func IsIPv4(ip net.IP) bool {
-	return ip.To4() != nil
+	return ip != nil && ip.To4() != nil
+}
+
+// IsIPv6 returns if netIP is IPv6.
+func IsIPv6(ip net.IP) bool {
+	return ip != nil && ip.To4() == nil
+}
+
+// SortedIPListsAreEqual compares two lists of sorted IPs. If any differ it returns
+// false.
+func SortedIPListsAreEqual(a, b []net.IP) bool {
+	// The IP set is definitely different if the lengths are different.
+	if len(a) != len(b) {
+		return false
+	}
+
+	// Lengths are equal, so each member in one set must be in the other
+	// If any IPs at the same index differ the sorted IP list are not equal.
+	for i := range a {
+		if !a[i].Equal(b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// UsortedIPListsAreEqual returns true if the list of net.IP provided is same
+// without considering the order of the IPs in the list. The function will first
+// attempt to sort both the IP lists and then validate equality for sorted lists.
+func UsortedIPListsAreEqual(ipList1, ipList2 []net.IP) bool {
+	// The IP set is definitely different if the lengths are different.
+	if len(ipList1) != len(ipList2) {
+		return false
+	}
+
+	ipListLen := len(ipList1)
+	sortedIPList1 := make([]net.IP, ipListLen)
+	sortedIPList2 := make([]net.IP, ipListLen)
+
+	for i := 0; i < ipListLen; i++ {
+		sortedIPList1[i] = ipList1[i]
+		sortedIPList2[i] = ipList2[i]
+	}
+
+	sort.Slice(sortedIPList1, func(i, j int) bool {
+		return bytes.Compare(sortedIPList1[i], sortedIPList1[j]) < 0
+	})
+	sort.Slice(sortedIPList2, func(i, j int) bool {
+		return bytes.Compare(sortedIPList2[i], sortedIPList2[j]) < 0
+	})
+
+	return SortedIPListsAreEqual(sortedIPList1, sortedIPList2)
 }

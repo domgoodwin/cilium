@@ -25,7 +25,9 @@ import (
 	"github.com/cilium/cilium/pkg/cidr"
 	"github.com/cilium/cilium/pkg/comparator"
 	"github.com/cilium/cilium/pkg/datapath"
+	"github.com/cilium/cilium/pkg/ip"
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
+	"github.com/cilium/cilium/pkg/k8s/utils"
 	"github.com/cilium/cilium/pkg/loadbalancer"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/option"
@@ -98,7 +100,21 @@ func ParseService(svc *slim_corev1.Service, nodeAddressing datapath.NodeAddressi
 		return ServiceID{}, nil
 	}
 
-	clusterIP := net.ParseIP(svc.Spec.ClusterIP)
+	var clusterIPs []net.IP
+	if len(svc.Spec.ClusterIPs) == 0 {
+		if clsIP := net.ParseIP(svc.Spec.ClusterIP); clsIP != nil {
+			clusterIPs = []net.IP{clsIP}
+		}
+	} else {
+		// Here we assume that the value of .spec.ClusterIPs[0] is same as that of the .spec.clusterIP
+		// or else Kubernetes will reject the service with validation error.
+		for _, ip := range svc.Spec.ClusterIPs {
+			if parsedIP := net.ParseIP(ip); parsedIP != nil {
+				clusterIPs = append(clusterIPs, parsedIP)
+			}
+		}
+	}
+
 	headless := false
 	if strings.ToLower(svc.Spec.ClusterIP) == "none" {
 		headless = true
@@ -123,10 +139,11 @@ func ParseService(svc *slim_corev1.Service, nodeAddressing datapath.NodeAddressi
 		lbSrcRanges = append(lbSrcRanges, cidrStringTrimmed)
 	}
 
-	svcInfo := NewService(clusterIP, svc.Spec.ExternalIPs, loadBalancerIPs,
+	svcInfo := NewService(clusterIPs, svc.Spec.ExternalIPs, loadBalancerIPs,
 		lbSrcRanges, headless, trafficPolicy,
 		uint16(svc.Spec.HealthCheckNodePort), svc.Labels, svc.Spec.Selector,
 		svc.GetNamespace(), svcType)
+
 	svcInfo.IncludeExternal = getAnnotationIncludeExternal(svc)
 	svcInfo.Shared = getAnnotationShared(svc)
 
@@ -172,7 +189,7 @@ func ParseService(svc *slim_corev1.Service, nodeAddressing datapath.NodeAddressi
 				}
 
 				if option.Config.EnableIPv4 &&
-					clusterIP != nil && !strings.Contains(svc.Spec.ClusterIP, ":") {
+					utils.GetClusterIPByFamily(slim_corev1.IPv4Protocol, svc) != "" {
 
 					for _, ip := range nodeAddressing.IPv4().LoadBalancerNodeAddresses() {
 						nodePortFE := loadbalancer.NewL3n4AddrID(proto, ip, port,
@@ -181,7 +198,7 @@ func ParseService(svc *slim_corev1.Service, nodeAddressing datapath.NodeAddressi
 					}
 				}
 				if option.Config.EnableIPv6 &&
-					clusterIP != nil && strings.Contains(svc.Spec.ClusterIP, ":") {
+					utils.GetClusterIPByFamily(slim_corev1.IPv6Protocol, svc) != "" {
 
 					for _, ip := range nodeAddressing.IPv6().LoadBalancerNodeAddresses() {
 						nodePortFE := loadbalancer.NewL3n4AddrID(proto, ip, port,
@@ -242,18 +259,17 @@ func ParseServiceIDFrom(dn string) *ServiceID {
 type NodePortToFrontend map[string]*loadbalancer.L3n4AddrID
 
 // Service is an abstraction for a k8s service that is composed by the frontend IP
-// address (FEIP) and the map of the frontend ports (Ports).
+// addresses (FEIPs) and the map of the frontend ports (Ports).
 //
 // +k8s:deepcopy-gen=true
 // +deepequal-gen=true
 // +deepequal-gen:private-method=true
 type Service struct {
-	//
 	// Until deepequal-gen adds support for net.IP we need to compare this field
 	// manually.
 	// +deepequal-gen=false
-	FrontendIP net.IP
-	IsHeadless bool
+	FrontendIPs []net.IP
+	IsHeadless  bool
 
 	// IncludeExternal is true when external endpoints from other clusters
 	// should be included
@@ -314,7 +330,7 @@ func (s *Service) DeepEqual(other *Service) bool {
 		return other == nil
 	}
 
-	if !s.FrontendIP.Equal(other.FrontendIP) {
+	if !ip.UsortedIPListsAreEqual(s.FrontendIPs, other.FrontendIPs) {
 		return false
 	}
 
@@ -326,15 +342,14 @@ func (s *Service) DeepEqual(other *Service) bool {
 
 		if len(in) != len(other) {
 			return false
-		} else {
-			for key, inValue := range in {
-				if otherValue, present := other[key]; !present {
-					return false
-				} else {
-					if !inValue.Equal(otherValue) {
-						return false
-					}
-				}
+		}
+		for key, inValue := range in {
+			otherValue, present := other[key]
+			if !present {
+				return false
+			}
+			if !inValue.Equal(otherValue) {
+				return false
 			}
 		}
 	}
@@ -347,15 +362,14 @@ func (s *Service) DeepEqual(other *Service) bool {
 
 		if len(in) != len(other) {
 			return false
-		} else {
-			for key, inValue := range in {
-				if otherValue, present := other[key]; !present {
-					return false
-				} else {
-					if !inValue.Equal(otherValue) {
-						return false
-					}
-				}
+		}
+		for key, inValue := range in {
+			otherValue, present := other[key]
+			if !present {
+				return false
+			}
+			if !inValue.Equal(otherValue) {
+				return false
 			}
 		}
 	}
@@ -376,7 +390,7 @@ func (s *Service) String() string {
 		i++
 	}
 
-	return fmt.Sprintf("frontend:%s/ports=%s/selector=%v", s.FrontendIP.String(), ports, s.Selector)
+	return fmt.Sprintf("frontends:%s/ports=%s/selector=%v", s.FrontendIPs, ports, s.Selector)
 }
 
 // IsExternal returns true if the service is expected to serve out-of-cluster endpoints:
@@ -396,7 +410,7 @@ func parseIPs(externalIPs []string) map[string]net.IP {
 }
 
 // NewService returns a new Service with the Ports map initialized.
-func NewService(ip net.IP, externalIPs, loadBalancerIPs, loadBalancerSourceRanges []string,
+func NewService(ips []net.IP, externalIPs, loadBalancerIPs, loadBalancerSourceRanges []string,
 	headless bool, trafficPolicy loadbalancer.SVCTrafficPolicy,
 	healthCheckNodePort uint16, labels, selector map[string]string,
 	namespace string, svcType loadbalancer.SVCType) *Service {
@@ -419,7 +433,7 @@ func NewService(ip net.IP, externalIPs, loadBalancerIPs, loadBalancerSourceRange
 	}
 
 	return &Service{
-		FrontendIP: ip,
+		FrontendIPs: ips,
 
 		IsHeadless:          headless,
 		TrafficPolicy:       trafficPolicy,
@@ -468,7 +482,9 @@ func NewClusterService(id ServiceID, k8sService *Service, k8sEndpoints *Endpoint
 	}
 
 	svc.Frontends = map[string]serviceStore.PortConfiguration{}
-	svc.Frontends[k8sService.FrontendIP.String()] = portConfig
+	for _, feIP := range k8sService.FrontendIPs {
+		svc.Frontends[feIP.String()] = portConfig
+	}
 
 	svc.Backends = map[string]serviceStore.PortConfiguration{}
 	for ipString, backend := range k8sEndpoints.Backends {
@@ -493,15 +509,17 @@ func NewClusterService(id ServiceID, k8sService *Service, k8sEndpoints *Endpoint
 // ParseClusterService() is paired with EqualsClusterService() that
 // has the above wired in.
 func ParseClusterService(svc *serviceStore.ClusterService) *Service {
-	var ip net.IP
+	feIPs := make([]net.IP, len(svc.Frontends))
 	var ipStr string
 	ports := serviceStore.PortConfiguration{}
-	for ipStr, ports = range svc.Frontends {
-		ip = net.ParseIP(ipStr)
-		break
+
+	i := 0
+	for ipStr = range svc.Frontends {
+		feIPs[i] = net.ParseIP(ipStr)
+		i++
 	}
 	svcInfo := &Service{
-		FrontendIP:      ip,
+		FrontendIPs:     feIPs,
 		IsHeadless:      len(svc.Frontends) == 0,
 		IncludeExternal: true,
 		Shared:          true,
@@ -534,16 +552,18 @@ func (s *Service) EqualsClusterService(svc *serviceStore.ClusterService) bool {
 		return true
 	}
 
-	var ip net.IP
+	feIPs := make([]net.IP, len(svc.Frontends))
 	var ipStr string
 	ports := serviceStore.PortConfiguration{}
-	for ipStr, ports = range svc.Frontends {
-		ip = net.ParseIP(ipStr)
-		break
+
+	i := 0
+	for ipStr = range svc.Frontends {
+		feIPs[i] = net.ParseIP(ipStr)
+		i++
 	}
 
 	// These comparisons must match the ParseClusterService() function above.
-	if s.FrontendIP.Equal(ip) &&
+	if ip.UsortedIPListsAreEqual(s.FrontendIPs, feIPs) &&
 		s.IsHeadless == (len(svc.Frontends) == 0) &&
 		s.IncludeExternal == true &&
 		s.Shared == true &&
